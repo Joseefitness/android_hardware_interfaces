@@ -3,3 +3,9 @@ service vendor.gatekeeper-1-0 /vendor/bin/hw/android.hardware.gatekeeper@1.0-ser
     class hal
     user system
     group system
+
+# Persistent failure-counter dir for the software gatekeeper throttle. In
+# /metadata so it is reachable at the lock screen (before /data unlocks) and
+# survives reboot; missing dir falls back to a RAM-only throttle.
+on post-fs-data
+    mkdir /metadata/gatekeeper 0700 system system
