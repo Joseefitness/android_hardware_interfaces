@@ -1,0 +1,5 @@
+<compatibility-matrix version="1.0" type="framework" level="5">
+  <!--
+    Intentionally empty: it imposes no requirement, which is how AOSP kept it.
+    -->
+</compatibility-matrix>
