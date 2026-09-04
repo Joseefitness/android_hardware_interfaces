@@ -23,6 +23,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
 #include "bluetooth_address.h"
 #include "h4_protocol.h"
 #include "mct_protocol.h"
@@ -54,6 +58,22 @@ bool recent_activity_flag;
 
 VendorInterface* g_vendor_interface = nullptr;
 std::mutex wakeup_mutex_;
+
+// The transport is shared between the Bluetooth stack and the FM radio side
+// channel, so it stays open as long as either of them holds a reference.
+std::mutex g_transport_mutex;
+int g_transport_refs = 0;
+
+// Guards the callbacks the Bluetooth stack registers, which the reader thread
+// dispatches to.
+std::mutex g_callback_mutex;
+bool g_stack_attached = false;
+
+// Firmware configuration is asynchronous and happens once per transport.
+std::mutex g_firmware_mutex;
+std::condition_variable g_firmware_cv;
+bool g_firmware_done = false;
+bool g_firmware_ok = false;
 
 HC_BT_HDR* WrapPacketAndCopy(uint16_t event, const hidl_vec<uint8_t>& data) {
   size_t packet_size = data.size() + sizeof(HC_BT_HDR);
@@ -163,36 +183,131 @@ class FirmwareStartupTimer {
   std::chrono::steady_clock::time_point start_time_;
 };
 
-bool VendorInterface::Initialize(
-    InitializeCompleteCallback initialize_complete_cb,
-    PacketReadCallback event_cb, PacketReadCallback acl_cb,
-    PacketReadCallback sco_cb, PacketReadCallback iso_cb) {
-  if (g_vendor_interface) {
-    ALOGE("%s: No previous Shutdown()?", __func__);
-    return false;
+bool VendorInterface::AcquireTransport() {
+  std::lock_guard<std::mutex> lock(g_transport_mutex);
+
+  if (g_vendor_interface == nullptr) {
+    {
+      std::lock_guard<std::mutex> firmware_lock(g_firmware_mutex);
+      g_firmware_done = false;
+      g_firmware_ok = false;
+    }
+    // The vendor library calls back into us through VendorInterface::get()
+    // while Open() is running, so publish the instance first.
+    g_vendor_interface = new VendorInterface();
+    if (!g_vendor_interface->Open()) {
+      g_vendor_interface->Close();
+      delete g_vendor_interface;
+      g_vendor_interface = nullptr;
+      return false;
+    }
   }
-  g_vendor_interface = new VendorInterface();
-  return g_vendor_interface->Open(initialize_complete_cb, event_cb, acl_cb,
-                                  sco_cb, iso_cb);
+
+  g_transport_refs++;
+  return true;
 }
 
-void VendorInterface::Shutdown() {
-  LOG_ALWAYS_FATAL_IF(!g_vendor_interface, "%s: No Vendor interface!",
-                      __func__);
+void VendorInterface::ReleaseTransport() {
+  std::lock_guard<std::mutex> lock(g_transport_mutex);
+
+  if (g_transport_refs == 0) {
+    ALOGE("%s: transport is not open", __func__);
+    return;
+  }
+  if (--g_transport_refs > 0) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> firmware_lock(g_firmware_mutex);
+    g_firmware_done = false;
+    g_firmware_ok = false;
+  }
+
+  // Close() still talks to the controller, which reaches us back through
+  // VendorInterface::get(), so the instance has to stay published.
   g_vendor_interface->Close();
   delete g_vendor_interface;
   g_vendor_interface = nullptr;
 }
 
+bool VendorInterface::WaitForFirmwareConfigured(int timeout_ms) {
+  std::unique_lock<std::mutex> lock(g_firmware_mutex);
+  g_firmware_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                         []() { return g_firmware_done; });
+  return g_firmware_done && g_firmware_ok;
+}
+
+bool VendorInterface::Initialize(
+    InitializeCompleteCallback initialize_complete_cb,
+    PacketReadCallback event_cb, PacketReadCallback acl_cb,
+    PacketReadCallback sco_cb, PacketReadCallback iso_cb) {
+  if (!AcquireTransport()) {
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    g_vendor_interface->initialize_complete_cb_ = initialize_complete_cb;
+    g_vendor_interface->event_cb_ = event_cb;
+    g_vendor_interface->acl_cb_ = acl_cb;
+    g_vendor_interface->sco_cb_ = sco_cb;
+    g_vendor_interface->iso_cb_ = iso_cb;
+    g_stack_attached = true;
+  }
+
+  // The FM side channel may have configured the firmware already, in which
+  // case no further completion is coming and we have to report it ourselves.
+  bool done;
+  bool ok;
+  {
+    std::lock_guard<std::mutex> firmware_lock(g_firmware_mutex);
+    done = g_firmware_done;
+    ok = g_firmware_ok;
+  }
+  if (done) {
+    InitializeCompleteCallback cb;
+    {
+      std::lock_guard<std::mutex> lock(g_callback_mutex);
+      cb = g_vendor_interface->initialize_complete_cb_;
+      g_vendor_interface->initialize_complete_cb_ = nullptr;
+    }
+    if (cb != nullptr) {
+      cb(ok);
+    }
+  }
+
+  return true;
+}
+
+void VendorInterface::Shutdown() {
+  {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    if (!g_stack_attached) {
+      ALOGW("%s: no Bluetooth stack attached", __func__);
+      return;
+    }
+    g_stack_attached = false;
+    if (g_vendor_interface != nullptr) {
+      g_vendor_interface->initialize_complete_cb_ = nullptr;
+      g_vendor_interface->event_cb_ = nullptr;
+      g_vendor_interface->acl_cb_ = nullptr;
+      g_vendor_interface->sco_cb_ = nullptr;
+      g_vendor_interface->iso_cb_ = nullptr;
+    }
+  }
+
+  ReleaseTransport();
+}
+
 VendorInterface* VendorInterface::get() { return g_vendor_interface; }
 
-bool VendorInterface::Open(InitializeCompleteCallback initialize_complete_cb,
-                           PacketReadCallback event_cb,
-                           PacketReadCallback acl_cb,
-                           PacketReadCallback sco_cb,
-                           PacketReadCallback iso_cb) {
-  initialize_complete_cb_ = initialize_complete_cb;
+bool VendorInterface::IsStackAttached() {
+  std::lock_guard<std::mutex> lock(g_callback_mutex);
+  return g_stack_attached;
+}
 
+bool VendorInterface::Open() {
   // Initialize vendor interface
 
   lib_handle_ = dlopen(VENDOR_LIBRARY_NAME, RTLD_NOW);
@@ -246,20 +361,28 @@ bool VendorInterface::Open(InitializeCompleteCallback initialize_complete_cb,
     }
   }
 
-  event_cb_ = event_cb;
   PacketReadCallback intercept_events = [this](const hidl_vec<uint8_t>& event) {
     HandleIncomingEvent(event);
   };
+  PacketReadCallback forward_acl = [this](const hidl_vec<uint8_t>& packet) {
+    DispatchToStack(acl_cb_, packet);
+  };
+  PacketReadCallback forward_sco = [this](const hidl_vec<uint8_t>& packet) {
+    DispatchToStack(sco_cb_, packet);
+  };
+  PacketReadCallback forward_iso = [this](const hidl_vec<uint8_t>& packet) {
+    DispatchToStack(iso_cb_, packet);
+  };
 
   if (fd_count == 1) {
-    hci::H4Protocol* h4_hci =
-        new hci::H4Protocol(fd_list[0], intercept_events, acl_cb, sco_cb, iso_cb);
+    hci::H4Protocol* h4_hci = new hci::H4Protocol(
+        fd_list[0], intercept_events, forward_acl, forward_sco, forward_iso);
     fd_watcher_.WatchFdForNonBlockingReads(
         fd_list[0], [h4_hci](int fd) { h4_hci->OnDataReady(fd); });
     hci_ = h4_hci;
   } else {
     hci::MctProtocol* mct_hci =
-        new hci::MctProtocol(fd_list, intercept_events, acl_cb);
+        new hci::MctProtocol(fd_list, intercept_events, forward_acl);
     fd_watcher_.WatchFdForNonBlockingReads(
         fd_list[CH_EVT], [mct_hci](int fd) { mct_hci->OnEventDataReady(fd); });
     fd_watcher_.WatchFdForNonBlockingReads(
@@ -339,10 +462,22 @@ void VendorInterface::OnFirmwareConfigured(uint8_t result) {
     firmware_startup_timer_ = nullptr;
   }
 
-  if (initialize_complete_cb_ != nullptr) {
-    initialize_complete_cb_(result == 0);
+  InitializeCompleteCallback cb;
+  {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    cb = initialize_complete_cb_;
     initialize_complete_cb_ = nullptr;
   }
+  if (cb != nullptr) {
+    cb(result == 0);
+  }
+
+  {
+    std::lock_guard<std::mutex> firmware_lock(g_firmware_mutex);
+    g_firmware_done = true;
+    g_firmware_ok = (result == 0);
+  }
+  g_firmware_cv.notify_all();
 
   lib_interface_->op(BT_VND_OP_GET_LPM_IDLE_TIMEOUT, &lpm_timeout_ms);
   ALOGI("%s: lpm_timeout_ms %d", __func__, lpm_timeout_ms);
@@ -369,6 +504,18 @@ void VendorInterface::OnTimeout() {
   recent_activity_flag = false;
 }
 
+void VendorInterface::DispatchToStack(const PacketReadCallback& cb,
+                                      const hidl_vec<uint8_t>& packet) {
+  PacketReadCallback copy;
+  {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    copy = cb;
+  }
+  if (copy != nullptr) {
+    copy(packet);
+  }
+}
+
 void VendorInterface::HandleIncomingEvent(const hidl_vec<uint8_t>& hci_packet) {
   if (internal_command.cb != nullptr &&
       internal_command_event_match(hci_packet)) {
@@ -378,9 +525,10 @@ void VendorInterface::HandleIncomingEvent(const hidl_vec<uint8_t>& hci_packet) {
     tINT_CMD_CBACK saved_cb = internal_command.cb;
     internal_command.cb = nullptr;
     saved_cb(bt_hdr);
-  } else {
-    event_cb_(hci_packet);
+    return;
   }
+
+  DispatchToStack(event_cb_, hci_packet);
 }
 
 }  // namespace implementation

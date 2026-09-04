@@ -61,7 +61,7 @@ Return<void> BluetoothHci::initialize(
     return Void();
   }
 
-  if (VendorInterface::get() != nullptr) {
+  if (VendorInterface::IsStackAttached()) {
     ALOGW("BluetoothHci is already initialized");
     auto hidl_status = cb->initializationComplete(Status::INITIALIZATION_ERROR);
     if (!hidl_status.isOk()) {
