@@ -19,6 +19,7 @@
 
 #include <log/log.h>
 
+#include "fm_channel.h"
 #include "vendor_interface.h"
 
 namespace android {
@@ -148,6 +149,7 @@ void BluetoothHci::sendDataToController(const uint8_t type,
 }
 
 IBluetoothHci* HIDL_FETCH_IBluetoothHci(const char* /* name */) {
+  FmChannel::Start();
   return new BluetoothHci();
 }
 

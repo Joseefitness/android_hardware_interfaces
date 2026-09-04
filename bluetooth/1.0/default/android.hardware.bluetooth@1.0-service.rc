@@ -4,5 +4,6 @@ service vendor.bluetooth-1-0 /vendor/bin/hw/android.hardware.bluetooth@1.0-servi
     capabilities BLOCK_SUSPEND NET_ADMIN SYS_NICE
     user bluetooth
     group bluetooth
+    socket fm_hci seqpacket 0660 bluetooth bluetooth
     task_profiles HighPerformance
 

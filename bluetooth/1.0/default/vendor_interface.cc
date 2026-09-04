@@ -28,6 +28,7 @@
 #include <mutex>
 
 #include "bluetooth_address.h"
+#include "fm_channel.h"
 #include "h4_protocol.h"
 #include "mct_protocol.h"
 
@@ -517,6 +518,12 @@ void VendorInterface::DispatchToStack(const PacketReadCallback& cb,
 }
 
 void VendorInterface::HandleIncomingEvent(const hidl_vec<uint8_t>& hci_packet) {
+  // The FM radio traffic never belongs to the Bluetooth stack, and handing it
+  // an unexpected event is fatal for it.
+  if (FmChannel::DeliverEvent(hci_packet)) {
+    return;
+  }
+
   if (internal_command.cb != nullptr &&
       internal_command_event_match(hci_packet)) {
     HC_BT_HDR* bt_hdr = WrapPacketAndCopy(HCI_PACKET_TYPE_EVENT, hci_packet);
