@@ -58,7 +58,7 @@ Return<void> BluetoothHci::initialize(const ::android::sp<IBluetoothHciCallbacks
         return Void();
     }
 
-    if (VendorInterface::get() != nullptr) {
+    if (VendorInterface::IsStackAttached()) {
         ALOGW("BluetoothHci is already initialized");
         auto hidl_status = cb->initializationComplete(Status::INITIALIZATION_ERROR);
         if (!hidl_status.isOk()) {

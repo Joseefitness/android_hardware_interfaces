@@ -44,6 +44,16 @@ class VendorInterface {
     static void Shutdown();
     static VendorInterface* get();
 
+    // True while the Bluetooth stack holds the callbacks. The transport itself
+    // may be open without a stack when the FM side channel is using it.
+    static bool IsStackAttached();
+
+    // The transport is shared with the FM radio side channel, so its lifetime is
+    // reference counted instead of being tied to the Bluetooth stack.
+    static bool AcquireTransport();
+    static void ReleaseTransport();
+    static bool WaitForFirmwareConfigured(int timeout_ms);
+
     size_t Send(uint8_t type, const uint8_t* data, size_t length);
 
     void OnFirmwareConfigured(uint8_t result);
@@ -51,12 +61,12 @@ class VendorInterface {
   private:
     virtual ~VendorInterface() = default;
 
-    bool Open(InitializeCompleteCallback initialize_complete_cb, PacketReadCallback event_cb,
-              PacketReadCallback acl_cb, PacketReadCallback sco_cb, PacketReadCallback iso_cb);
+    bool Open();
     void Close();
 
     void OnTimeout();
 
+    void DispatchToStack(const PacketReadCallback& cb, const hidl_vec<uint8_t>& packet);
     void HandleIncomingEvent(const hidl_vec<uint8_t>& hci_packet);
 
     void* lib_handle_ = nullptr;
@@ -66,6 +76,9 @@ class VendorInterface {
     hci::HciProtocol* hci_ = nullptr;
 
     PacketReadCallback event_cb_;
+    PacketReadCallback acl_cb_;
+    PacketReadCallback sco_cb_;
+    PacketReadCallback iso_cb_;
 
     FirmwareStartupTimer* firmware_startup_timer_ = nullptr;
 };
