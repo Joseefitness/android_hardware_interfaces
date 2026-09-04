@@ -29,6 +29,7 @@ cc_defaults {
     srcs: [
         "bluetooth_hci.cc",
         "bluetooth_address.cc",
+        "fm_channel.cc",
         "vendor_interface.cc",
     ],
     shared_libs: [
